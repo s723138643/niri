@@ -7,6 +7,7 @@ use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::commit_timing::{CommitTimerBarrierStateUserData, CommitTimerStateUserData};
 use smithay::wayland::compositor::{
     add_post_commit_hook, add_pre_commit_hook, get_parent, is_sync_subsurface,
     remove_pre_commit_hook, with_states, BufferAssignment, CompositorClientState,
@@ -53,6 +54,7 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         self.add_default_dmabuf_pre_commit_hook(surface);
+        self.add_commit_timing_pre_commit_hook(surface);
         self.add_fifo_post_commit_hook(surface);
     }
 
@@ -573,6 +575,32 @@ impl State {
         } else {
             error!("tried to remove dmabuf pre-commit hook but there was none");
         }
+    }
+
+    pub fn add_commit_timing_pre_commit_hook(&mut self, surface: &WlSurface) {
+        if !surface.is_alive() {
+            error!("tried to add commit_timing pre-commit hook for a dead surface");
+            return;
+        }
+
+        add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            let need_insert = with_states(surface, |surface_data| {
+                let has_timestamp = surface_data
+                    .data_map
+                    .get::<CommitTimerStateUserData>()
+                    .is_some_and(|s| s.borrow().timestamp.is_some());
+
+                let has_pending = surface_data
+                    .data_map
+                    .get::<CommitTimerBarrierStateUserData>()
+                    .is_some_and(|s| s.lock().unwrap().next_deadline().is_some());
+
+                has_timestamp || has_pending
+            });
+            if need_insert {
+                state.niri.add_commit_timing_surfaces(surface);
+            }
+        });
     }
 
     pub fn add_fifo_post_commit_hook(&mut self, surface: &WlSurface) {

@@ -74,9 +74,12 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{
     Buffer as BufferCoords, ClockSource, DeviceFd, IsAlive as _, Logical, Monotonic, Physical,
-    Point, Rectangle, Scale, Size, Transform, SERIAL_COUNTER,
+    Point, Rectangle, Scale, Size, Time, Transform, SERIAL_COUNTER,
 };
 use smithay::wayland::background_effect::BackgroundEffectState;
+use smithay::wayland::commit_timing::{
+    CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
+};
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
     CompositorState, HookId, SurfaceData, TraversalAction,
@@ -206,6 +209,9 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+const COMMIT_TIMING_TIMER_MAX_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMIT_TIMING_TIMER_MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Parts of the seat keyboard state that get reset when its keymap is replaced.
 #[derive(Debug, Clone, Copy, Default)]
@@ -358,6 +364,9 @@ pub struct Niri {
     syncobj_state: Option<SyncobjState>,
     fifo_surfaces: HashSet<WlSurface>,
     pub fifo_manager_state: FifoManagerState,
+    commit_timing_surfaces: HashSet<WlSurface>,
+    commit_timing_timer: Option<(RegistrationToken, Duration)>,
+    pub commit_timing_manager_state: CommitTimingManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -832,6 +841,11 @@ impl State {
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
+        {
+            let _span = tracy_client::span!("State::commit_timing");
+            let next_deadline = self.niri.signal_commit_timing();
+            self.niri.arm_commit_timing(next_deadline);
+        }
         self.refresh();
 
         // Advance animations to the current time (not target render time) before rendering outputs
@@ -2660,6 +2674,8 @@ impl Niri {
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
         let syncobj_state = None;
         let fifo_manager_state = FifoManagerState::new::<State>(&display_handle);
+        let commit_timing_timer = None;
+        let commit_timing_manager_state = CommitTimingManagerState::new::<State>(&display_handle);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -2870,6 +2886,9 @@ impl Niri {
             syncobj_state,
             fifo_surfaces: HashSet::new(),
             fifo_manager_state,
+            commit_timing_surfaces: HashSet::new(),
+            commit_timing_timer,
+            commit_timing_manager_state,
             #[cfg(test)]
             single_pixel_buffer_state,
 
@@ -7433,6 +7452,142 @@ impl Niri {
         for client in clients.into_values() {
             let _ = self.blocker_cleared_tx.send(client);
         }
+    }
+
+    pub fn add_commit_timing_surfaces(&mut self, surface: &WlSurface) {
+        self.commit_timing_surfaces.insert(surface.clone());
+    }
+
+    pub fn signal_commit_timing(&mut self) -> Option<Duration> {
+        if self.commit_timing_surfaces.is_empty() {
+            return None;
+        }
+
+        let mut remove: Vec<WlSurface> = Vec::new();
+        let mut next_wakeup: Option<Duration> = None;
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+
+        let mut next_presentations: HashMap<Output, Duration> = HashMap::new();
+        let now = get_monotonic_time();
+        for surface in &self.commit_timing_surfaces {
+            if !surface.is_alive() {
+                remove.push(surface.clone());
+                continue;
+            }
+
+            let res: Option<(bool, Duration, Option<Timestamp>, Option<Output>)> =
+                with_states(surface, |surface_data| {
+                    let o = surface_primary_scanout_output(surface, surface_data);
+                    let deadline = match o.as_ref() {
+                        Some(o) => {
+                            if next_presentations.contains_key(o) {
+                                *next_presentations.get(o).unwrap()
+                            } else {
+                                let next_presentation = self
+                                    .output_state
+                                    .get(o)
+                                    .map(|s| s.frame_clock.presentation_time_after(now))
+                                    .unwrap_or(now);
+                                next_presentations.insert(o.clone(), next_presentation);
+                                next_presentation
+                            }
+                        }
+                        None => now,
+                    };
+                    let deadline = deadline.max(now);
+                    let mut barrier = surface_data
+                        .data_map
+                        .get::<CommitTimerBarrierStateUserData>()?
+                        .lock()
+                        .unwrap();
+                    let deadline_: Timestamp = Time::<Monotonic>::from(deadline).into();
+                    let signaled = barrier.signal_until(deadline_);
+                    Some((signaled, deadline, barrier.next_deadline(), o))
+                });
+
+            match res {
+                Some((signaled_, deadline, next_deadline, output)) => {
+                    if signaled_ {
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
+                    }
+                    match next_deadline {
+                        Some(next) => {
+                            let next = Time::<Monotonic>::from(next).into();
+                            let wakeup = match output {
+                                Some(o) if deadline > now => self
+                                    .output_state
+                                    .get(&o)
+                                    .map(|s| s.frame_clock.prev_presentation_time(next))
+                                    .unwrap_or(next),
+                                _ => next,
+                            };
+                            next_wakeup = Some(next_wakeup.map_or(wakeup, |w| w.min(wakeup)));
+                        }
+                        None => remove.push(surface.clone()),
+                    }
+                }
+                None => remove.push(surface.clone()),
+            };
+        }
+
+        for client in clients.into_values() {
+            let _ = self.blocker_cleared_tx.send(client);
+        }
+        for surface in &remove {
+            self.commit_timing_surfaces.remove(surface);
+        }
+
+        next_wakeup
+    }
+
+    pub fn arm_commit_timing(&mut self, next_wakeup: Option<Duration>) {
+        let next_wakeup = match (next_wakeup, self.commit_timing_timer) {
+            (Some(next_wakeup_), Some((token, old))) => {
+                if old <= next_wakeup_ {
+                    return;
+                }
+                self.commit_timing_timer = None;
+                self.event_loop.remove(token);
+                next_wakeup_
+            }
+            (Some(next_wakeup_), None) => next_wakeup_,
+            (None, Some((token, _))) => {
+                self.commit_timing_timer = None;
+                self.event_loop.remove(token);
+                return;
+            }
+            (None, None) => {
+                return;
+            }
+        };
+
+        let mut timeout = next_wakeup
+            .saturating_sub(get_monotonic_time())
+            .max(COMMIT_TIMING_TIMER_MIN_TIMEOUT);
+        if timeout > COMMIT_TIMING_TIMER_MAX_TIMEOUT {
+            debug!(
+                "commit_timing timer has a huge timeout `{:?}s`, limited to `{:?}s`",
+                timeout.as_secs_f64(),
+                COMMIT_TIMING_TIMER_MAX_TIMEOUT.as_secs_f64()
+            );
+            timeout = COMMIT_TIMING_TIMER_MAX_TIMEOUT;
+        }
+
+        let res =
+            self.event_loop
+                .insert_source(Timer::from_duration(timeout), move |_, _, state| {
+                    state.niri.commit_timing_timer = None;
+
+                    TimeoutAction::Drop
+                });
+        match res {
+            Ok(token) => {
+                self.commit_timing_timer = Some((token, next_wakeup));
+            }
+            Err(e) => warn!("register commit_timing timer failed, error={e:?}"),
+        };
     }
 }
 
