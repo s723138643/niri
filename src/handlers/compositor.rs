@@ -12,10 +12,11 @@ use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 use smithay::wayland::shell::xdg::ToplevelCachedState;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 
-use super::blocker::add_dmabuf_blocker;
+use super::blocker::{add_dmabuf_blocker, add_syncobj_blocker};
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
@@ -531,8 +532,8 @@ impl State {
         }
 
         let hook = add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
-            let maybe_dmabuf = with_states(surface, |surface_data| {
-                surface_data
+            let (maybe_dmabuf, acquire_point) = with_states(surface, |surface_data| {
+                let maybe_dmabuf = surface_data
                     .cached_state
                     .get::<SurfaceAttributes>()
                     .pending()
@@ -541,8 +542,18 @@ impl State {
                     .and_then(|assignment| match assignment {
                         BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
                         _ => None,
-                    })
+                    });
+                let acquire_point = surface_data
+                    .cached_state
+                    .get::<DrmSyncobjCachedState>()
+                    .pending()
+                    .acquire_point
+                    .clone();
+
+                (maybe_dmabuf, acquire_point)
             });
+
+            add_syncobj_blocker(surface, acquire_point, &state.niri.event_loop, None);
             add_dmabuf_blocker(surface, maybe_dmabuf, &state.niri.event_loop, None);
         });
 

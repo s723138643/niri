@@ -911,6 +911,10 @@ impl Tty {
             }
         }
 
+        if render_node == Some(self.primary_render_node) {
+            niri.update_syncobj_state(&device_fd);
+        }
+
         let allocator_gbm = if render_node.is_some() {
             gbm.clone()
         } else if let Some(primary_device) = self.devices.get(&self.primary_node) {
@@ -1188,10 +1192,21 @@ impl Tty {
             // Sometimes (Asahi DisplayLink), multiple primary nodes will correspond to the same
             // render node. In this case, we want to keep the render node active until the last
             // primary node that uses it is gone.
-            let was_last = !self
+            let remains: Vec<&DrmDeviceFd> = self
                 .devices
                 .values()
-                .any(|device| device.render_node == Some(render_node));
+                .filter(|device| device.render_node == Some(render_node))
+                .map(|device| device.drm.device_fd())
+                .collect();
+            let was_last = remains.is_empty();
+
+            // The syncobj state follows the primary render node's device: re-point the import
+            // device at a remaining device that shares the render node, or drop the global.
+            if render_node == self.primary_render_node {
+                niri.drop_syncobj_state(remains);
+            } else {
+                drop(remains);
+            }
 
             if was_last && render_node == self.primary_render_node {
                 debug!("destroying the primary renderer");

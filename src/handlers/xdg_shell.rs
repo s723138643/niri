@@ -23,6 +23,7 @@ use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, HookId, SurfaceAttributes,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 use smithay::wayland::input_method::InputMethodSeat;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::wlr_layer::{self, Layer};
@@ -35,6 +36,7 @@ use smithay::wayland::xdg_foreign::{XdgForeignHandler, XdgForeignState};
 use tracing::field::Empty;
 
 use super::blocker::add_dmabuf_blocker;
+use crate::handlers::blocker::add_syncobj_blocker;
 use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::{AnyStartData, DOUBLE_CLICK_TIME};
@@ -1513,7 +1515,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             return;
         };
 
-        let (got_unmapped, dmabuf, commit_serial) = with_states(surface, |states| {
+        let (got_unmapped, dmabuf, commit_serial, acquire_point) = with_states(surface, |states| {
             let (got_unmapped, dmabuf) = {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
                 match guard.pending().buffer.as_ref() {
@@ -1534,7 +1536,14 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 .unwrap();
             let serial = role.last_acked.as_ref().map(|c| c.serial);
 
-            (got_unmapped, dmabuf, serial)
+            let acquire_point = states
+                .cached_state
+                .get::<DrmSyncobjCachedState>()
+                .pending()
+                .acquire_point
+                .clone();
+
+            (got_unmapped, dmabuf, serial, acquire_point)
         });
 
         let mut transaction_for_dmabuf = None;
@@ -1583,6 +1592,14 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             error!("commit on a mapped surface without a configured serial");
         };
 
+        // Completing the transaction until both the syncboj and dmabuf are ready.
+        // So we delay dropping the cloned transaction until the blocker is cleared.
+        add_syncobj_blocker(
+            surface,
+            acquire_point,
+            &state.niri.event_loop,
+            transaction_for_dmabuf.clone(),
+        );
         add_dmabuf_blocker(
             surface,
             dmabuf,

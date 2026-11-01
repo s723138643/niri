@@ -1,8 +1,10 @@
 use calloop::{EventSource, Interest, LoopHandle, RegistrationToken};
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::renderer::sync::Fence;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::wayland::compositor::{add_blocker, Blocker, CompositorHandler as _};
+use smithay::wayland::drm_syncobj::DrmSyncPoint;
 
 use crate::niri::State;
 use crate::utils::transaction::Transaction;
@@ -62,4 +64,41 @@ where
         .map_err(|e| e.error)?;
     add_blocker(surface, blocker);
     Ok(res)
+}
+
+pub fn add_syncobj_blocker(
+    surface: &WlSurface,
+    acquire_point: Option<DrmSyncPoint>,
+    event_loop: &LoopHandle<State>,
+    transaction: Option<Transaction>,
+) {
+    let Some(client) = surface.client() else {
+        return;
+    };
+
+    let acquire_point = match acquire_point {
+        Some(point) if point.is_signaled() => {
+            return;
+        }
+        Some(point) => point,
+        None => {
+            return;
+        }
+    };
+
+    let (blocker, source) = match acquire_point.generate_blocker() {
+        Ok(res) => res,
+        Err(e) => {
+            error!("generate syncobj blocker failed, error: {e:?}");
+            return;
+        }
+    };
+    let res = add_blocker_and_source(surface, client, blocker, source, transaction, event_loop);
+    match res {
+        Ok(_) => trace!("surface:{:?} added syncobj blocker", surface.id()),
+        Err(e) => error!(
+            "surface:{:?} insert syncobj event source failed, error: {e:?}",
+            surface.id()
+        ),
+    };
 }
