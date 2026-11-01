@@ -84,6 +84,7 @@ use smithay::wayland::compositor::{
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
@@ -355,6 +356,8 @@ pub struct Niri {
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
     syncobj_state: Option<SyncobjState>,
+    fifo_surfaces: HashSet<WlSurface>,
+    pub fifo_manager_state: FifoManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -2656,6 +2659,7 @@ impl Niri {
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
         let syncobj_state = None;
+        let fifo_manager_state = FifoManagerState::new::<State>(&display_handle);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -2864,6 +2868,8 @@ impl Niri {
             activation_state,
             mutter_x11_interop_state,
             syncobj_state,
+            fifo_surfaces: HashSet::new(),
+            fifo_manager_state,
             #[cfg(test)]
             single_pixel_buffer_state,
 
@@ -3280,6 +3286,9 @@ impl Niri {
         self.gamma_control_manager_state.output_removed(output);
 
         let state = self.output_state.remove(output).unwrap();
+        if self.output_state.is_empty() {
+            self.signal_fifo_all();
+        }
 
         match state.redraw_state {
             RedrawState::Idle => (),
@@ -3400,6 +3409,7 @@ impl Niri {
 
         self.monitors_active = false;
         backend.set_monitors_active(false);
+        self.signal_fifo_all();
     }
 
     pub fn activate_monitors(&mut self, backend: &mut Backend) {
@@ -5494,10 +5504,16 @@ impl Niri {
                 should_send,
             );
         }
+
+        {
+            let _span = tracy_client::span!("Niri::signal_fifo");
+            self.signal_fifo(output);
+        }
     }
 
     pub fn send_frame_callbacks_on_fallback_timer(&mut self) {
         if !self.monitors_active || self.output_state.is_empty() {
+            self.signal_fifo_all();
             return;
         }
 
@@ -5566,6 +5582,11 @@ impl Niri {
                 FRAME_CALLBACK_THROTTLE,
                 |_, _| None,
             );
+        }
+
+        {
+            let _span = tracy_client::span!("Niri::signal_fifo");
+            self.signal_fifo(output);
         }
     }
 
@@ -7321,6 +7342,96 @@ impl Niri {
     pub fn queue_redraw_mru_output(&mut self) {
         if let Some(output) = self.window_mru_ui.output().cloned() {
             self.queue_redraw(&output);
+        }
+    }
+
+    pub fn add_fifo_surface(&mut self, surface: &WlSurface) {
+        self.fifo_surfaces.insert(surface.clone());
+    }
+
+    pub fn signal_fifo(&mut self, output: &Output) {
+        if self.fifo_surfaces.is_empty() {
+            return;
+        }
+
+        enum Action {
+            ClearBlocker,
+            Insert,
+            Ignore,
+        }
+
+        let mut remains: Vec<WlSurface> = Vec::new();
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+        for surface in self.fifo_surfaces.drain() {
+            if !surface.is_alive() {
+                continue;
+            }
+            let ret = with_states(&surface, |surface_data| {
+                if surface_primary_scanout_output(&surface, surface_data)
+                    .as_ref()
+                    .map(|o| o != output && self.output_state.contains_key(o))
+                    .unwrap_or(false)
+                {
+                    return Action::Insert;
+                }
+
+                if let Some(barrier) = surface_data
+                    .cached_state
+                    .get::<FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .take()
+                {
+                    barrier.signal();
+                    return Action::ClearBlocker;
+                };
+                Action::Ignore
+            });
+            match ret {
+                Action::ClearBlocker => {
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
+                }
+                Action::Insert => {
+                    remains.push(surface);
+                }
+                Action::Ignore => {}
+            }
+        }
+        self.fifo_surfaces.extend(remains);
+        for client in clients.into_values() {
+            let _ = self.blocker_cleared_tx.send(client);
+        }
+    }
+
+    pub fn signal_fifo_all(&mut self) {
+        if self.fifo_surfaces.is_empty() {
+            return;
+        }
+
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+        for surface in self.fifo_surfaces.drain() {
+            if !surface.is_alive() {
+                continue;
+            }
+            with_states(&surface, |surface_data| {
+                if let Some(barrier) = surface_data
+                    .cached_state
+                    .get::<FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .take()
+                {
+                    barrier.signal();
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
+                };
+            });
+        }
+        for client in clients.into_values() {
+            let _ = self.blocker_cleared_tx.send(client);
         }
     }
 }

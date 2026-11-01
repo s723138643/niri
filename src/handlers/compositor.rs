@@ -8,11 +8,13 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, get_parent, is_sync_subsurface, remove_pre_commit_hook, with_states,
-    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
+    add_post_commit_hook, add_pre_commit_hook, get_parent, is_sync_subsurface,
+    remove_pre_commit_hook, with_states, BufferAssignment, CompositorClientState,
+    CompositorHandler, CompositorState, SurfaceAttributes,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
+use smithay::wayland::fifo::FifoBarrierCachedState;
 use smithay::wayland::shell::xdg::ToplevelCachedState;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 
@@ -51,6 +53,7 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         self.add_default_dmabuf_pre_commit_hook(surface);
+        self.add_fifo_post_commit_hook(surface);
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -570,5 +573,26 @@ impl State {
         } else {
             error!("tried to remove dmabuf pre-commit hook but there was none");
         }
+    }
+
+    pub fn add_fifo_post_commit_hook(&mut self, surface: &WlSurface) {
+        if !surface.is_alive() {
+            error!("tried to add fifo post-commit hook for a dead surface");
+            return;
+        }
+
+        add_post_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            let has_fifo = with_states(surface, |surface_data| {
+                surface_data
+                    .cached_state
+                    .get::<FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .is_some()
+            });
+            if has_fifo {
+                state.niri.add_fifo_surface(surface);
+            }
+        });
     }
 }
